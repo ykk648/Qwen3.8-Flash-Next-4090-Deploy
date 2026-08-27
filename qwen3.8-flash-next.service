@@ -1,0 +1,23 @@
+[Unit]
+Description=Qwen3.8-Flash-Next llama.cpp server (4x RTX 4090)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/codes/qwen3.8-flash-next-llamacpp
+Environment=CONTEXT=131072
+Environment=BATCH_SIZE=2048
+Environment=UBATCH_SIZE=512
+Environment=SPLIT_MODE=layer
+ExecStart=%h/codes/qwen3.8-flash-next-llamacpp/launch.sh 4gpu
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=120
+LimitMEMLOCK=infinity
+StandardOutput=append:%h/codes/qwen3.8-flash-next-llamacpp/llama-server.log
+StandardError=append:%h/codes/qwen3.8-flash-next-llamacpp/llama-server.log
+
+[Install]
+WantedBy=default.target

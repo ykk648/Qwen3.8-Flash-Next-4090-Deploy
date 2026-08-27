@@ -1,0 +1,38 @@
+# Credentials and local environment
+.api-key
+.env
+.env.*
+*.pem
+*.key
+token
+
+# Model weights and download caches
+models/
+*.gguf
+*.gguf.incomplete
+.cache/
+
+# Upstream source clone and build artifacts
+llama.cpp/
+build/
+CMakeFiles/
+CMakeCache.txt
+
+# Runtime state
+*.log
+*.pid
+nohup.out
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local benchmark output
+benchmark-results/
+*.benchmark.json
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

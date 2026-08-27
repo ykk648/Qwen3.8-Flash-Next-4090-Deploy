@@ -1,0 +1,54 @@
+{
+  "models": [
+    {
+      "slug": "qwen3.8-flash-next",
+      "display_name": "Qwen3.8 Flash Next (Local)",
+      "description": "Local Qwen3.8-Flash-Next IQ4_XS served by llama.cpp on 4x RTX 4090.",
+      "base_instructions": "You are Codex, a coding agent. Work directly in the user's repository, use tools when needed, make focused changes, verify your work, and report results concisely.",
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low",
+          "description": "Lower Codex reasoning budget"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced Codex reasoning budget"
+        },
+        {
+          "effort": "high",
+          "description": "Higher Codex reasoning budget"
+        }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "additional_speed_tiers": [],
+      "service_tiers": [],
+      "availability_nux": null,
+      "upgrade": null,
+      "supports_reasoning_summaries": true,
+      "default_reasoning_summary": "none",
+      "support_verbosity": false,
+      "default_verbosity": null,
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text",
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": false,
+      "supports_image_detail_original": false,
+      "context_window": 131072,
+      "max_context_window": 131072,
+      "effective_context_window_percent": 88,
+      "experimental_supported_tools": [],
+      "input_modalities": [
+        "text"
+      ],
+      "supports_search_tool": false,
+      "use_responses_lite": false
+    }
+  ]
+}
