@@ -294,6 +294,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
   --host 0.0.0.0 \
   --port 8001 \
   --jinja \
+  --chat-template-file "$DEPLOY_ROOT/qwen3.8-flash-next-codex.jinja" \
   --reasoning-format deepseek \
   --alias qwen3.8-flash-next \
   --cache-prompt \
@@ -611,6 +612,46 @@ codex -p qwen-flash exec "Inspect the repository and run the most relevant tests
 
 工具调用测试中，模型成功执行 `pwd` 并返回正确工作目录。
 
+### 14.4 多轮会话的 Chat Template 兼容修复
+
+模型 GGUF 内置模板只允许 `system` / `developer` 消息连续出现在消息列表开头。Codex 的
+Responses API 多轮历史可能在 user、assistant 或 tool 消息之后再次插入 developer 消息，原模板会返回：
+
+```text
+HTTP 500
+Jinja Exception: System message must be at the beginning.
+```
+
+Cloudflare 或 Codex 此时可能只显示通用的高负载提示，但根因是 llama.cpp 的模板异常，单纯重启服务不会修复。
+
+仓库中的 `qwen3.8-flash-next-codex.jinja` 做了两项兼容处理：
+
+1. 按原始顺序收集全部 `system` / `developer` 内容，并合并到开头的 system block。
+2. 后续渲染消息历史时跳过这些已合并消息，不再抛出顺序异常。
+
+启动时必须显式加载：
+
+```bash
+--chat-template-file "$DEPLOY_ROOT/qwen3.8-flash-next-codex.jinja"
+```
+
+2026-08-28 实机验证结果：
+
+- 本机 `/v1/responses`：HTTP 200。
+- Cloudflare 公网 `/v1/models` 与 `/v1/responses`：HTTP 200。
+- 包含中途 developer 消息的请求正常完成，模板异常计数未增加。
+- `codex exec -p qwen-flash` 完整链路正常返回。
+
+排查时先确认进程参数中存在 `--chat-template-file`，再检查日志：
+
+```bash
+systemctl --user status qwen3.8-flash-next.service --no-pager -l
+grep -n "System message must be at the beginning" llama-server.log | tail
+```
+
+llama.cpp 仍可能提示跳过 Responses API 中尚不支持的 `custom`、`namespace`、`tool_search` 或
+`web_search` 工具类型；这与本节的消息顺序 500 是两个独立问题。
+
 ## 15. DFlash2：为什么没有使用
 
 当前 Flash-Next llama.cpp 服务没有使用 DFlash2。
@@ -776,6 +817,7 @@ git ls-files | grep -E '(api-key|\.env|token|\.gguf|llama-server\.log)'
 | `long_context_benchmark.py` | 长 context prefill 与 passkey 测试 |
 | `prompt_cache_benchmark.py` | Responses API cache 命中测试 |
 | `codex-models.json` | Codex 本地模型 metadata |
+| `qwen3.8-flash-next-codex.jinja` | 兼容 Codex 多轮 developer/system 消息的模板 |
 | `qwen3.8-flash-next.service` | systemd user unit 示例 |
 
 ## 22. 复现检查清单
@@ -789,6 +831,8 @@ git ls-files | grep -E '(api-key|\.env|token|\.gguf|llama-server\.log)'
 - [ ] 首先启动 4 卡 layer split
 - [ ] 验证 `/v1/models`
 - [ ] 验证 `/v1/responses` streaming
+- [ ] 确认进程已加载 Codex 兼容 chat template
+- [ ] 验证中途 developer 消息不会触发 HTTP 500
 - [ ] 运行 200/512-token decode benchmark
 - [ ] 连续请求验证 Prompt Cache
 - [ ] 根据业务长度测试 8K/32K context

@@ -10,6 +10,7 @@ BATCH_SIZE=${BATCH_SIZE:-2048}
 UBATCH_SIZE=${UBATCH_SIZE:-512}
 SPLIT_MODE=${SPLIT_MODE:-layer}
 API_KEY_FILE=${API_KEY_FILE:-$ROOT/.api-key}
+CHAT_TEMPLATE=${CHAT_TEMPLATE:-$ROOT/qwen3.8-flash-next-codex.jinja}
 
 case "$PROFILE" in
   3gpu)
@@ -40,6 +41,7 @@ args=(
   --host 0.0.0.0
   --port "$PORT"
   --jinja
+  --chat-template-file "$CHAT_TEMPLATE"
   --reasoning-format deepseek
   --alias qwen3.8-flash-next
   --cache-prompt
