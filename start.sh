@@ -2,12 +2,12 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PROFILE=${1:-4gpu}
+PROFILE=${1:-2gpu}
 PID_FILE="$ROOT/llama-server.pid"
 LOG_FILE="$ROOT/llama-server.log"
 SERVICE=qwen3.8-flash-next.service
 
-if [[ "$PROFILE" == 4gpu ]] && systemctl --user cat "$SERVICE" >/dev/null 2>&1; then
+if [[ "$PROFILE" == 2gpu ]] && systemctl --user cat "$SERVICE" >/dev/null 2>&1; then
   systemctl --user start "$SERVICE"
   echo "Started $SERVICE."
   exit 0

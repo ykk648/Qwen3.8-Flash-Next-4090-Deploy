@@ -1,565 +1,349 @@
-# Qwen3.8-Flash-Next on 8× RTX 4090
+# Qwen3.8-Flash-Next on RTX 4090 48GB
 
-> 从 SGLang FP8 到 llama.cpp GGUF：消费级多卡部署、卡数探索、长上下文、Prompt Cache、
-> Responses API 与 Codex 接入实测报告。
+在一台 **8 x RTX 4090 48GB、无 NVLink** 的服务器上，探索
+Qwen3.8-Flash-Next 面向单用户 Codex 的低延迟部署路线。
 
-## 摘要
+本文所有新数据均为 2026-09-08 实机结果。上一台 8 x 24GB 机器的数据仅作为历史对照。
 
-本报告记录在一台 **8× RTX 4090 24GB、无 NVLink** 的服务器上部署
-Qwen3.8-Flash-Next 的完整过程。
+## 结论
 
-最终生产方案：
+当前最佳生产路线：
 
-| 项目 | 最终配置 |
+| 项目 | 配置 |
 |---|---|
-| 推理引擎 | Unsloth llama.cpp Qwen4Exp 分支 |
+| 引擎 | Unsloth llama.cpp MTP PR #144 |
+| 固定提交 | `a9e9c3c5fed8a0bb5cc617532d0d16b8f59c13e0` |
 | 模型 | `unsloth/Qwen3.8-Flash-Next-GGUF` |
-| 量化 | `UD-IQ4_XS`，约 93.7GB |
-| GPU | 4× RTX 4090，使用同一 NUMA node 内的 GPU |
-| 多卡切分 | `--split-mode layer` |
-| Context | 131,072 tokens |
-| 并发 slots | 1 |
-| Prompt Cache | 显式开启 |
+| 量化 | `UD-IQ4_XS`，93.68GB |
+| GPU | **2 x RTX 4090 48GB**，同 NUMA、同 PIX 组 |
+| 切分 | `--split-mode layer` |
+| Context | **262,144** |
+| MTP | shared Q8_0，`draft=4` |
+| 并发 | 1 slot |
 | API | OpenAI-compatible Responses / Chat Completions / Completions |
-| 512-token Decode | **42.25 tok/s** 三次中位数 |
-| 热实例单次复验 | **44.17 tok/s** |
+| 512-token decode | **123.61 tok/s**，三次中位数 |
+| 英文单 prompt 峰值 | **126.09 tok/s**，`draft=5` |
 
-主要结论：
+最重要的发现：
 
-1. RTX 4090 上的 SGLang FP8 路线受 SM89 后端、QSA fallback 和 CUDA graph 限制，
-   本机最佳仅为 14.50 tok/s。
-2. 参考社区方案切换到 llama.cpp + GGUF 后，4 卡稳定达到 42–44 tok/s。
-3. 对无 NVLink 的消费卡，llama.cpp 默认的 **layer split** 明显比实验性的 tensor split 更合适。
-4. 3 卡是 `UD-IQ4_XS` 的最低全 GPU 可运行配置，但显存余量太小；4 卡是最佳单副本配置。
-5. 8 卡单副本受跨 NUMA/SYS 通信影响，反而比 4 卡慢约 4.3%。
-6. 最佳整机利用方式是两个独立 4 卡副本，而不是一个 8 卡副本。
-7. 131K context 可以实际检索远距离信息，但冷 prefill 很慢；Prompt Cache 对 Codex 多轮会话至关重要。
+1. 48GB 卡让 `UD-IQ4_XS` 在 2 卡上全 GPU 运行，2 卡比 3/4 卡更快。
+2. MTP 已可用。旧报告中“llama.cpp 不支持 Flash-Next MTP”的结论已经过期。
+3. 面向中英文和代码生成的稳健默认是 `draft=4`；`draft=5` 只在本次英文 prompt 上略快。
+4. 真实 250K 请求完成并正确检索 passkey，不是只验证服务能分配 262K KV cache。
+5. 该机器所有 GPU 间 PCIe P2P 不可用，row split 无法加载；layer split 是正确路线。
+6. MTP 适合单并发低延迟，不应直接用于高并发吞吐服务。
 
-所有结果均来自单机实测，不应被视为其他硬件、驱动或模型版本的性能保证。
+## 实验环境
 
-## 1. 硬件与软件环境
+### 硬件
 
-### 1.1 硬件
+- GPU：8 x NVIDIA GeForce RTX 4090，49,140MiB/卡，SM89
+- Driver：580.173.02
+- PCIe：Gen4 x16
+- CPU：2 x Intel Xeon Gold 6462C，64 物理核 / 128 线程
+- RAM：1TiB
+- GPU 0-3：NUMA 0
+- GPU 4-7：NUMA 1
+- GPU 4/5 与 GPU 6/7 分别为 PIX 组
+- 无 NVLink
+- CUDA P2P read/write 与 PCIe P2P 均不可用
 
-- GPU：8× NVIDIA GeForce RTX 4090 24GB
-- GPU 互联：PCIe，无 NVLink
-- GPU 0–3：NUMA node 0，组内 PIX
-- GPU 4–7：NUMA node 1，组内 PIX
-- 两组 GPU 之间：SYS
-- CPU：144 logical CPUs，2 个 NUMA node
-- 内存：503GiB
-- 存储：NVMe，测试时约 2TiB 可用空间
+测试期间 GPU 0-2 有其他任务，因此所有新基准只使用 GPU 4-7，并将进程绑定到：
 
-### 1.2 软件
+```text
+CPU 32-63,96-127 / NUMA 1
+```
 
-- 操作系统：Linux
+仓库启动器默认选择 GPU 4、5。其他机器可以通过 `GPUS` 和 `CPU_SET` 显式覆盖。
+
+### 软件
+
 - CUDA Toolkit：12.8
-- NVIDIA Driver：610.43.02
-- llama.cpp 源码提交：
+- llama.cpp：`0.3.0-dev (build 10794, commit a9e9c3c5f)`
+- CUDA architecture：89
+- uv：0.12.10
+- cmake：4.4.3
+- ninja：1.13.2
 
-```text
-6c5afc86ae84448ae4d744e357017e2c490ad9c3
-```
+## 为什么选择 llama.cpp GGUF
 
-- 部署日期：2026-08-27
+Qwen3.8-Flash-Next 包含很大的 PLE n-gram embedding table。GGUF + mmap 可以让该表主要
+保留在系统内存和页缓存中，计算权重则 offload 到 GPU。
 
-### 1.3 NUMA 选择
+本机 2 卡 131K、无 MTP 时显存约为：
 
-单副本优先选择同一 NUMA node 内的四张 GPU，例如 GPU 0–3：
-
-```text
-GPU 0 ─┐
-GPU 1 ─┼─ NUMA 0 / PIX group
-GPU 2 ─┤
-GPU 3 ─┘
-
-GPU 4 ─┐
-GPU 5 ─┼─ NUMA 1 / PIX group
-GPU 6 ─┤
-GPU 7 ─┘
-```
-
-这可以避免单路生成跨 CPU socket 和 SYS 路径传输。
-
-## 2. 路线选择
-
-### 2.1 最初目标
-
-- 替换原有的 Qwen3.8-27B 服务。
-- 部署 Qwen3.8-Flash-Next。
-- 探索最低 GPU 数量。
-- 找到消费级 RTX 4090 上单用户、低并发场景的最快稳定配置。
-- 提供 OpenAI-compatible Responses API，供 Codex 使用。
-
-### 2.2 参考资料
-
-- [SGLang Qwen3.8-Flash-Next Cookbook](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next)
-- [Qwen3.8-Flash-Next-Fleet-Deploy](https://github.com/tonyd2wild/Qwen3.8-Flash-Next-Fleet-Deploy)
-- [Unsloth llama.cpp Qwen4Exp branch](https://github.com/unslothai/llama.cpp/tree/qwen4exp/qwen3.8-flash-next)
-- [llama.cpp](https://github.com/ggml-org/llama.cpp)
-
-社区参考项目中“4× RTX 3090 约 43 tok/s”的方案并不是 SGLang FP8，而是：
-
-- llama.cpp Qwen4Exp 实验分支；
-- `UD-IQ3_XXS` GGUF；
-- 4-way layer split；
-- 131K context；
-- 无 speculative decoding。
-
-本次部署沿用该架构思路，但选择质量更高的 `UD-IQ4_XS`。
-
-## 3. SGLang FP8 对照实验
-
-### 3.1 模型与版本
-
-模型：
-
-```text
-Qwen/Qwen3.8-Flash-Next-FP8
-```
-
-权重总大小：
-
-```text
-185,502,232,570 bytes
-```
-
-使用支持 PLE offload 的 SGLang 提交：
-
-```text
-73a255206f916366c8d26d4022f82ddfb0ab558d
-```
-
-### 3.2 RTX 4090 兼容性问题
-
-官方 H200 配置不能直接用于 RTX 4090：
-
-1. `TP8+EP1` 无法加载：专家中间维度被切分为 80，不满足 FP8 `block_n=128` 的对齐要求。
-2. `TP8+EP8` 可以加载。
-3. 官方 FlashInfer GDN 要求 SM90+；RTX 4090 是 SM89，因此需要 Triton GDN。
-4. QSA 默认 fallback 到 FA4 Cute，在 SM89 上出现 MLIR 编译错误。
-5. 增加 SM89 QSA correctness fallback 后可以运行。
-6. 该 fallback 无法完成 CUDA graph capture，只能 eager 执行。
-7. PyTorch SDPA 改写没有带来明显提升。
-8. NEXTN eager 有显著收益，但仍不满足目标速度。
-
-### 3.3 SGLang 实测
-
-512 输出 tokens，3 次运行取中位数：
-
-| 配置 | TTFT | Decode |
-|---|---:|---:|
-| TP8+EP8，eager，无 NEXTN | 0.40s | 6.21 tok/s |
-| TP8+EP8，NEXTN eager，8K | 0.49s | 14.50 tok/s |
-| TP8+EP8，NEXTN eager，radix cache，32K | 0.50s | 14.27 tok/s |
-
-结论：该路线功能可用，但 RTX 4090 缺少 H200/SM90 对应的高效执行路径，因此不作为最终方案。
-
-## 4. 为什么 llama.cpp GGUF 可行
-
-Qwen3.8-Flash-Next 包含很大的 PLE n-gram embedding table。GGUF/llama.cpp 路线可以通过
-mmap 让该表主要保留在 NVMe 和操作系统页缓存中，而不是把整个表加载到 VRAM。
-
-因此模型文件虽然约 93.7GB，实际常驻 GPU 的主要计算权重和运行缓存仍能分布到 3–4 张
-24GB 消费卡上。
-
-当前 Qwen4Exp llama.cpp 分支尚未实现该架构的 MTP/NEXTN/DFlash2 speculative decoding，
-本报告中的 42–44 tok/s 是纯自回归速度。
-
-## 5. 构建 llama.cpp
-
-建议将本仓库脚本目录设为 `$DEPLOY_ROOT`，将 llama.cpp clone 到其子目录：
-
-```bash
-export DEPLOY_ROOT="$PWD"
-
-git clone --depth 1 \
-  --branch qwen4exp/qwen3.8-flash-next \
-  https://github.com/unslothai/llama.cpp.git \
-  "$DEPLOY_ROOT/llama.cpp"
-```
-
-针对 RTX 4090 / SM89 构建：
-
-```bash
-cmake -S "$DEPLOY_ROOT/llama.cpp" \
-  -B "$DEPLOY_ROOT/llama.cpp/build" \
-  -DGGML_CUDA=ON \
-  -DLLAMA_CURL=OFF \
-  -DCMAKE_CUDA_ARCHITECTURES=89 \
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build "$DEPLOY_ROOT/llama.cpp/build" \
-  --target llama-server llama-bench \
-  -j "$(nproc)"
-```
-
-生成的服务程序：
-
-```text
-$DEPLOY_ROOT/llama.cpp/build/bin/llama-server
-```
-
-## 6. 模型下载与校验
-
-模型仓库：
-
-```text
-unsloth/Qwen3.8-Flash-Next-GGUF
-```
-
-量化目录：
-
-```text
-UD-IQ4_XS
-```
-
-本次下载得到的分片：
-
-| 文件 | bytes |
+| GPU | 显存 |
 |---|---:|
-| `Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` | 10,946,624 |
-| `Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf` | 49,835,229,856 |
-| `Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf` | 43,836,407,744 |
-| **总计** | **93,682,584,224** |
+| GPU 4 | 35,697MiB |
+| GPU 5 | 34,089MiB |
 
-服务返回的模型元数据：
+最终 2 卡 262K + MTP `draft=4` 实例约为 39,493MiB / 42,263MiB，仍有可用余量。
 
-- `n_ctx_train=262144`
-- `n_params=176943899520`
-- `size=93671559680`
-- `ftype=IQ4_XS - 4.25 bpw`
+单卡无法全 GPU 加载 IQ4_XS：即使 context 降到 32K，仍尝试分配约 61.2GiB CUDA
+权重缓冲。将 32 层 offload 到单卡后可以运行，但只有 17.83 tok/s。
 
-将首分片路径配置到 `MODEL`：
+## 与参考路线的关系
 
-```bash
-export MODEL="$DEPLOY_ROOT/models/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
-```
+本次参考了：
 
-不要将 GGUF 权重提交到 Git 仓库。
+- [A-XIANGQAQ/Qwen3.8-Flash-Next-4090](https://github.com/A-XIANGQAQ/Qwen3.8-Flash-Next-4090)
+- [TomPython/Qwen-3.8-Flash-Next](https://github.com/TomPython/Qwen-3.8-Flash-Next)
+- [Unsloth Qwen3.8 Flash Next GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
+- [Unsloth llama.cpp MTP PR #144](https://github.com/unslothai/llama.cpp/pull/144)
 
-## 7. 关键优化：Layer Split
+A-XIANGQAQ 的单 48GB 卡方案和 TomPython 的双卡方案使用 NVFP4 + Lsglang/lk_moe
+CPU-GPU 混合推理，适合卡数受限场景。其公开 decode 约为 36-40 tok/s 和 34.8 tok/s。
 
-### 7.1 不推荐 Tensor Split
+本机目标是“卡数不限、单流尽可能快”，因此选择 2 x 48GB 全 GPU GGUF + MTP。
+这些结果不是同一量化和同一引擎下的严格横向质量评测。
 
-实验初期曾显式设置：
+## 使用 uv 和国内源
 
-```text
---split-mode tensor
-```
-
-这是实验性的权重/KV tensor parallel 模式，会在层内产生频繁的跨卡通信。对于无 NVLink 的
-RTX 4090，PCIe 通信开销会抵消并行收益。
-
-### 7.2 最终选择
-
-最终采用：
-
-```text
---split-mode layer
-```
-
-Layer split 主要在设备边界传递 activation，更接近参考 4×3090 方案，也更适合 PCIe 多卡。
-
-这是本次从低速配置恢复到 40+ tok/s 的关键修正。
-
-## 8. 最终启动配置
-
-### 8.1 API Key
-
-生成独立 API key：
+所有 Python 环境由 `uv` 管理。引导脚本使用清华 PyPI 为主源、阿里云 PyPI 为备用源，
+uv cache 也保存在项目目录内：
 
 ```bash
-openssl rand -hex 32 > .api-key
+./tools/bootstrap.sh
+```
+
+如果系统尚无 uv，脚本只使用系统 Python 从上述国内 PyPI 安装固定版本 uv；随后所有
+虚拟环境和 Python 包安装均由 uv 完成。
+
+## 下载模型
+
+默认使用 ModelScope 国内镜像：
+
+```bash
+./tools/download-model.sh
+```
+
+切换到 hf-mirror：
+
+```bash
+DOWNLOAD_BASE=https://hf-mirror.com/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main \
+  ./tools/download-model.sh
+```
+
+下载器支持 HTTP Range、分块内断点续传、低速超时和已有分块复用。默认只使用一个连接，
+避免代理或镜像在高并发下载时重置 TLS。
+
+国内镜像不可用时，可在当前 shell 临时设置标准代理环境变量后重试。不要把代理地址、
+凭据或环境文件提交到仓库。
+
+模型文件：
+
+| 文件 | bytes | SHA256 |
+|---|---:|---|
+| `UD-IQ4_XS/...00001-of-00003.gguf` | 10,946,624 | `5ce89370...e71a4` |
+| `UD-IQ4_XS/...00002-of-00003.gguf` | 49,835,229,856 | `577a38a2...aaa7` |
+| `UD-IQ4_XS/...00003-of-00003.gguf` | 43,836,407,744 | `d4634e6d...8833` |
+| `MTP/...shared-Q8_0.gguf` | 2,786,568,256 | `5ff54097...e6` |
+
+完整校验值位于 `model-checksums.sha256`：
+
+```bash
+sha256sum --check model-checksums.sha256
+```
+
+模型、分块和下载缓存均被 Git 忽略。
+
+## 构建 llama.cpp
+
+```bash
+./tools/build-llama.sh
+```
+
+脚本固定到 Unsloth MTP PR #144 的完整 commit，并针对 SM89 构建
+`llama-server` 和 `llama-bench`。
+
+不能使用旧的 `qwen4exp/qwen3.8-flash-next` commit `eaf9376` 运行 shared MTP。
+该版本虽然显示 `--spec-type draft-mtp`，但缺少 shared tensor borrowing，实际会因
+`token_embd.weight not found` 退出。
+
+shared MTP 在新版本启动时会先输出一条内存预估警告：
+
+```text
+borrow_shared_tensor: this model is a draft head without its own token_embd.weight
+failed to measure the memory of the extra model, fitting without it
+```
+
+随后若日志出现 `loading draft model`、`model loaded` 和 `draft acceptance`，MTP
+就是正常工作的。这是 shared sidecar 单独预估时无法借用主模型 tensor 的已知行为。
+
+## 启动
+
+生成本地 API key：
+
+```bash
+openssl rand -out .api-key -hex 32
 chmod 600 .api-key
 ```
 
-不要将 `.api-key` 提交到 Git、日志、Issue 或示例配置中。
-
-### 8.2 生产启动命令
+最佳配置直接启动：
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
-"$DEPLOY_ROOT/llama.cpp/build/bin/llama-server" \
-  -m "$MODEL" \
-  -ngl 999 \
-  --split-mode layer \
-  --tensor-split 1,1,1,1 \
-  --ctx-size 131072 \
-  --batch-size 2048 \
-  --ubatch-size 512 \
-  --flash-attn on \
-  --parallel 1 \
-  --host 0.0.0.0 \
-  --port 8001 \
-  --jinja \
-  --chat-template-file "$DEPLOY_ROOT/qwen3.8-flash-next-codex.jinja" \
-  --reasoning-format deepseek \
-  --alias qwen3.8-flash-next \
-  --cache-prompt \
-  --metrics \
-  --api-key-file "$DEPLOY_ROOT/.api-key"
+./launch.sh
 ```
 
-仓库中的 `launch.sh`、`start.sh`、`stop.sh` 和 `status.sh` 对上述参数进行了封装。
-
-### 8.3 选择并发 1 的原因
-
-该部署目标是单用户 Codex 和低延迟生成：
+等价关键参数：
 
 ```text
+GPU 4,5
+--split-mode layer
+--ctx-size 262144
 --parallel 1
-```
-
-这可以让一个 slot 保留完整的 Prompt Cache，并避免多个请求分割 KV cache 和显存。
-
-如果目标是多用户吞吐，应重新测试 slots、context 分配和 continuous batching，而不是直接沿用本报告数据。
-
-## 9. 卡数探索
-
-### 9.1 汇总
-
-| GPU 配置 | Context | ubatch | 512-token Decode | 稳态 TTFT | 结论 |
-|---|---:|---:|---:|---:|---|
-| 3×4090，同 NUMA | 131K | 256 | **41.87 tok/s** | 0.304s | 可运行，但显存余量过小 |
-| 4×4090，同 NUMA | 131K | 512 | **42.25 tok/s** | **0.159s** | 最佳生产配置 |
-| 8×4090，跨 NUMA | 131K | 512 | **40.43 tok/s** | 0.202s | 单路更慢 |
-| 4×4090，同 NUMA | 262K | 512 | **41.98 tok/s** | 0.310s | 可用，但余量较少 |
-
-200-token 短输出对照：
-
-| GPU 配置 | Context | Decode 中位数 |
-|---|---:|---:|
-| 3×4090 | 32K | 42.32 tok/s |
-| 4×4090 | 131K | 42.23 tok/s |
-| 8×4090 | 131K | 40.41 tok/s |
-
-### 9.2 显存占用
-
-4 卡、131K、压测后：
-
-| GPU | 显存占用 |
-|---|---:|
-| GPU 0 | 19,086 MiB |
-| GPU 1 | 17,004 MiB |
-| GPU 2 | 17,404 MiB |
-| GPU 3 | 17,082 MiB |
-
-3 卡、131K、`ubatch=256`：
-
-| GPU | 显存占用 |
-|---|---:|
-| GPU 0 | 23,982 MiB |
-| GPU 1 | 22,226 MiB |
-| GPU 2 | 21,908 MiB |
-
-3 卡 GPU0 仅剩约 0.6GB。使用 `ubatch=512` 时出现过约 687MiB CUDA compute buffer
-分配失败，因此不建议把 3 卡作为无人值守生产配置。
-
-4 卡、262K：
-
-| GPU | 显存占用 |
-|---|---:|
-| GPU 0 | 20,656 MiB |
-| GPU 1 | 18,574 MiB |
-| GPU 2 | 18,974 MiB |
-| GPU 3 | 18,652 MiB |
-
-### 9.3 卡数结论
-
-- **最低全 GPU 卡数：3 卡。** 需要将 `ubatch` 降至 256，且显存余量很小。
-- **最佳单副本：4 卡。** 解码略快，显存安全余量明显更好。
-- **8 卡不适合单副本。** 512-token decode 比 4 卡慢约 4.3%。
-- **最佳整机吞吐：2×4 卡副本。** 两个 NUMA node 各运行一条独立 lane。
-- **2 卡不适合当前性能目标。** 需要明显 CPU offload，会偏离 40 tok/s 目标。
-
-## 10. 基准测试方法
-
-### 10.1 Decode 基准
-
-- OpenAI-compatible `/v1/completions` streaming API
-- 固定英文技术提示词
-- `temperature=0`
-- `ignore_eos=true`
-- Decode 速度按首 token 之后计算：
-
-```text
-(completion_tokens - 1) / (结束时间 - 首 token 时间)
-```
-
-- 200-token 测试用于接近社区参考口径
-- 512-token 测试用于确认持续生成速度
-
-运行：
-
-```bash
-./benchmark.py --runs 3 --output-tokens 512
-```
-
-### 10.2 生产实例复验
-
-最终 systemd 实例启动后，单次 512-token 请求达到：
-
-```text
-44.17 tok/s
-```
-
-该单次结果用于确认服务化后没有性能回退；正式对比仍使用三次中位数 42.25 tok/s。
-
-## 11. 长上下文实测
-
-### 11.1 测试方法
-
-在输入开头放置随机 8 位 passkey，随后填充到目标 token 数，在末尾要求模型仅输出 passkey。
-
-为了测量完整冷 prefill，请求设置：
-
-```text
-cache_prompt=false
-```
-
-### 11.2 结果
-
-| 实际输入 | 客户端 TTFT | 服务端 Prefill | Prefill 吞吐 | Decode | Passkey |
-|---:|---:|---:|---:|---:|---|
-| 7,999 tokens | 6.54s | 6.25s | 1,279.90 tok/s | 40.95 tok/s | 正确 |
-| 31,999 tokens | 79.37s | 78.92s | 405.47 tok/s | 36.38 tok/s | 正确 |
-| 63,999 tokens | 244.62s | 243.68s | 262.63 tok/s | 30.58 tok/s | 正确 |
-| 119,999 tokens | 804.43s | 802.73s | 149.49 tok/s | 23.73 tok/s | 正确 |
-
-### 11.3 结论
-
-- 8K、32K、64K、120K 均能找回输入开头的 passkey。
-- 8K 仍可交互；32K 冷 TTFT 已约 79 秒。
-- 64K 冷 TTFT 约 4.1 分钟。
-- 120K 冷 TTFT 约 13.4 分钟。
-- 长 context 不仅影响 prefill，也会让 decode 从 42–44 tok/s 下降到约 23.7 tok/s。
-- 131K 是可用容量，不是推荐的日常请求长度。
-- 日常交互建议控制在 8K–16K；32K 以上更适合离线任务或重复查询同一长文。
-- Passkey 只验证基础远距离信息保持，不等价于完整的长文推理或多跳问答评测。
-
-运行：
-
-```bash
-./long_context_benchmark.py
-```
-
-## 12. Prompt Cache
-
-### 12.1 显式开启
-
-llama.cpp server 默认开启 prompt cache，但生产命令仍显式设置：
-
-```text
+--spec-type draft-mtp
+--spec-draft-model models/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+--spec-draft-n-max 4
 --cache-prompt
 ```
 
-这样可以避免未来默认值或启动脚本变更造成无意关闭。
-
-### 12.2 Responses API 实测
-
-连续发送两次完全相同的 8K 输入：
-
-| 请求 | 输入 tokens | cached tokens | 总耗时 | 实际 prefill |
-|---|---:|---:|---:|---:|
-| 第一次 | 8,008 | 0 | 5.49s | 4.27s / 8,008 tokens |
-| 第二次 | 8,008 | **8,004** | **0.90s** | 0.129s / 4 new tokens |
-
-第二次请求复用了 99.95% 的输入 token，总耗时下降约 83.6%。
-
-这正是 Codex 多轮会话需要的行为：历史不变时只 prefill 新增消息，而不是每轮重新读取完整
-仓库上下文和对话历史。
-
-运行：
+常用覆盖：
 
 ```bash
-./prompt_cache_benchmark.py
+# 选择其他两张物理 GPU 和对应 NUMA CPU
+GPUS=0,1 CPU_SET=0-31,64-95 ./launch.sh 2gpu
+
+# 131K、关闭 MTP
+CONTEXT=131072 SPEC_MTP=0 ./launch.sh 2gpu
+
+# 英文固定输出可实验 draft=5
+DRAFT_N=5 ./launch.sh 2gpu
 ```
 
-### 12.3 Cache 使用边界
+默认仅监听 `127.0.0.1:8001`。确需局域网监听时显式设置 `HOST=0.0.0.0`，并确保
+`.api-key` 存在及防火墙策略正确。
 
-- Cache 依赖相同 token 前缀。
-- 改变 system prompt、工具定义、消息顺序或序列化方式可能降低命中率。
-- `--parallel 1` 让单用户场景更容易保留完整 slot cache。
-- 服务重启后，当前内存中的 slot cache 会丢失。
-- 本报告没有启用持久化 slot cache。
+启动器会检查目标 GPU 上是否已有 compute process；检测到忙碌 GPU 时默认拒绝启动。
+只有确认可以共享时才使用 `ALLOW_BUSY_GPUS=1` 覆盖。
 
-## 13. OpenAI-Compatible API
+后台运行：
 
-### 13.1 基础信息
+```bash
+./start.sh
+./status.sh
+./stop.sh
+```
+
+需要登录后自动启动时，安装用户级 systemd 服务。安装脚本会把当前仓库的绝对路径写入
+生成的单元文件，因此仓库不必位于家目录：
+
+```bash
+./tools/install-service.sh
+```
+
+## 卡数实测
+
+131K context、layer split、512 输出 tokens、greedy、3 次中位数：
+
+| 配置 | MTP | Decode | 相对 2 卡无 MTP |
+|---|---|---:|---:|
+| 2 x 48GB | 关闭 | **78.95 tok/s** | 1.00x |
+| 3 x 48GB | 关闭 | 75.89 tok/s | 0.96x |
+| 4 x 48GB | 关闭 | 75.46 tok/s | 0.96x |
+| 2 x 48GB | draft=5 | **126.09 tok/s** | 1.60x |
+| 3 x 48GB | draft=5 | 120.92 tok/s | 1.53x |
+| 4 x 48GB | draft=5 | 114.71 tok/s | 1.45x |
+
+无 MTP 显存：
+
+| 配置 | 各卡显存 |
+|---|---|
+| 2 卡 | 35,697 / 34,089MiB |
+| 3 卡 | 25,239 / 23,545 / 23,227MiB |
+| 4 卡 | 19,991 / 17,901 / 18,301 / 17,979MiB |
+
+layer split 在设备边界传递 activation。增加卡数不会让单 token 的各层并行执行，反而增加
+设备边界和同步，因此能放下模型的最少全 GPU 卡数通常最快。
+
+## MTP draft 长度
+
+2 卡、131K、固定英文技术 prompt：
+
+| draft | Decode 中位数 | 接受率 | 相对无 MTP |
+|---:|---:|---:|---:|
+| 关闭 | 78.95 | - | 1.00x |
+| 1 | 100.56 | 84.78% | 1.27x |
+| 2 | 110.90 | 74.82% | 1.40x |
+| 3 | 118.12 | 67.73% | 1.50x |
+| 4 | 123.61 | 62.81% | 1.57x |
+| 5 | **126.09** | 57.62% | **1.60x** |
+| 6 | 118.88 | 49.31% | 1.51x |
+
+不同 prompt 的 512-token 单次复验：
+
+| prompt | draft=4 | draft=5 |
+|---|---:|---:|
+| 英文技术说明 | 123.61（3 次中位数） | **126.09**（3 次中位数） |
+| 中文技术说明 | **121.08** | 118.34 |
+| Python 代码生成 | **122.13** | 121.76 |
+
+三类 prompt 等权平均几乎相同，但 draft=4 的接受率更高、波动更小，所以生产默认选择 4。
+
+MTP 的输出仍由主模型验证，不改变 greedy 结果。温度升高会降低接受率。高并发时 draft
+会占用本可用于 target batching 的计算资源，不能根据单并发结果推断高并发吞吐。
+
+## Split mode
+
+`layer` 是本机唯一推荐模式。
+
+2 卡 `row` 对照在加载阶段直接失败：
+
+```text
+device CUDA0 does not support split buffers
+```
+
+这与本机所有 GPU 间 P2P 不可用一致。不要在无 NVLink/P2P 的消费卡上把 row/tensor split
+当作默认路线。
+
+## Context 与 Prompt Cache
+
+2 卡、262K、MTP draft=4 的冷 passkey 检索：
+
+| 实际输入 | TTFT | 末端 decode | passkey |
+|---:|---:|---:|---|
+| 7,999 | 3.41s | 121.27 tok/s | 正确 |
+| 31,999 | 13.48s | 69.39 tok/s | 正确 |
+| 119,999 | 81.04s | 55.81 tok/s | 正确 |
+| 249,999 | 273.63s | 54.49 tok/s | 正确 |
+
+250K 证明模型能处理接近原生 262K 上限的真实请求，但 4.6 分钟冷 TTFT 不适合交互。
+日常 Codex 应依赖 prompt cache 和自动压缩，而不是反复冷 prefill 全历史。
+
+相同 8K Responses 请求：
+
+| 请求 | 输入 | cached | 总耗时 |
+|---|---:|---:|---:|
+| 第一次 | 8,008 | 0 | 3.82s |
+| 第二次 | 8,008 | 8,004 | **0.414s** |
+
+第二次复用 99.95% 输入，总耗时下降约 89.2%。
+
+## API 与 Codex
 
 ```text
 Base URL: http://127.0.0.1:8001/v1
 Model:    qwen3.8-flash-next
 ```
 
-可用接口包括：
-
-- `/v1/models`
-- `/v1/responses`
-- `/v1/chat/completions`
-- `/v1/completions`
-
-### 13.2 Responses API
+Responses API 示例：
 
 ```bash
-curl -N http://127.0.0.1:8001/v1/responses \
+curl http://127.0.0.1:8001/v1/responses \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.8-flash-next",
-    "input": "Reply with OK",
-    "stream": true
-  }'
+  -d '{"model":"qwen3.8-flash-next","input":"Reply with OK"}'
 ```
 
-实际返回包含：
-
-- reasoning item
-- message item
-- streaming text delta
-- usage
-- cached token 统计
-
-### 13.3 Chat Completions
-
-```bash
-curl -N http://127.0.0.1:8001/v1/chat/completions \
-  -H "Authorization: Bearer $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.8-flash-next",
-    "messages": [
-      {"role": "user", "content": "Write a Python LRU cache."}
-    ],
-    "temperature": 0,
-    "max_tokens": 1024,
-    "stream": true
-  }'
-```
-
-模型会生成 reasoning 内容。过小的输出 token 上限可能被 reasoning 消耗，应为最终答案保留足够空间。
-
-## 14. Codex 接入
-
-### 14.1 Codex Profile
-
-建议创建独立 profile，不覆盖现有默认 provider：
-
-```text
-~/.codex/qwen-flash.config.toml
-```
-
-示例：
+Codex provider 示例：
 
 ```toml
 model_provider = "qwen_flash"
 model = "qwen3.8-flash-next"
 model_reasoning_effort = "medium"
-model_context_window = 131072
-model_auto_compact_token_limit = 114688
-model_catalog_json = "/path/to/deploy/codex-models.json"
+model_context_window = 262144
+model_auto_compact_token_limit = 229376
+model_catalog_json = "/path/to/Qwen3.8-Flash-Next-4090-Deploy/codex-models.json"
 disable_response_storage = true
 
 [model_providers.qwen_flash]
@@ -572,279 +356,94 @@ stream_idle_timeout_ms = 900000
 
 [model_providers.qwen_flash.auth]
 command = "/usr/bin/cat"
-args = ["/path/to/deploy/.api-key"]
+args = ["/path/to/Qwen3.8-Flash-Next-4090-Deploy/.api-key"]
 refresh_interval_ms = 0
 ```
 
-启动：
-
-```bash
-codex -p qwen-flash
-```
-
-非交互调用：
-
-```bash
-codex -p qwen-flash exec "Inspect the repository and run the most relevant tests."
-```
-
-### 14.2 Model Catalog
-
-仓库中的 `codex-models.json` 为 Codex 声明：
-
-- 模型 slug：`qwen3.8-flash-next`
-- Context：131,072
-- 输入模态：text
-- Responses API
-- Freeform apply-patch tool
-
-如果不提供本地 model catalog，Codex 可能使用 fallback metadata，从而错误估计 context 或工具能力。
-
-### 14.3 Codex 验收
-
-已完成：
-
-- Responses API reasoning + message 返回
-- Codex profile 加载
-- 131K model metadata 加载
-- shell tool call
-- Prompt Cache 多轮复用
-
-工具调用测试中，模型成功执行 `pwd` 并返回正确工作目录。
-
-### 14.4 多轮会话的 Chat Template 兼容修复
-
-模型 GGUF 内置模板只允许 `system` / `developer` 消息连续出现在消息列表开头。Codex 的
-Responses API 多轮历史可能在 user、assistant 或 tool 消息之后再次插入 developer 消息，原模板会返回：
+仓库的 `qwen3.8-flash-next-codex.jinja` 会将多轮历史中的 system/developer 消息按原顺序
+归并到开头，避免内置模板抛出：
 
 ```text
-HTTP 500
 Jinja Exception: System message must be at the beginning.
 ```
 
-Cloudflare 或 Codex 此时可能只显示通用的高负载提示，但根因是 llama.cpp 的模板异常，单纯重启服务不会修复。
+本机已验证：
 
-仓库中的 `qwen3.8-flash-next-codex.jinja` 做了两项兼容处理：
+- Responses API 返回 reasoning + message
+- assistant 历史后再次出现 developer 消息：HTTP 200，正确返回 `amber`
+- function_call / function_call_output 后再次出现 developer 消息：HTTP 200
+- Prompt Cache 返回 cached token 统计
 
-1. 按原始顺序收集全部 `system` / `developer` 内容，并合并到开头的 system block。
-2. 后续渲染消息历史时跳过这些已合并消息，不再抛出顺序异常。
+## 基准方法
 
-启动时必须显式加载：
+`benchmark.py` 使用 streaming `/v1/completions`：
 
-```bash
---chat-template-file "$DEPLOY_ROOT/qwen3.8-flash-next-codex.jinja"
-```
-
-2026-08-28 实机验证结果：
-
-- 本机 `/v1/responses`：HTTP 200。
-- Cloudflare 公网 `/v1/models` 与 `/v1/responses`：HTTP 200。
-- 包含中途 developer 消息的请求正常完成，模板异常计数未增加。
-- `codex exec -p qwen-flash` 完整链路正常返回。
-
-排查时先确认进程参数中存在 `--chat-template-file`，再检查日志：
+- `temperature=0`
+- `ignore_eos=true`
+- 默认生成 512 tokens
+- 客户端 decode = 首 token 之后的 tokens / 时间
+- 同时记录服务端 `predicted_per_second`
+- MTP 时记录 `draft_n`、`draft_n_accepted` 和接受率
 
 ```bash
-systemctl --user status qwen3.8-flash-next.service --no-pager -l
-grep -n "System message must be at the beginning" llama-server.log | tail
+UV_CACHE_DIR=$PWD/.cache/uv ./.tools/uv run --no-project \
+  python benchmark.py --runs 3 --output-tokens 512
 ```
 
-llama.cpp 仍可能提示跳过 Responses API 中尚不支持的 `custom`、`namespace`、`tool_search` 或
-`web_search` 工具类型；这与本节的消息顺序 500 是两个独立问题。
+客户端与服务端速率在所有正式测试中基本一致。表中默认使用三次客户端中位数，不使用单次
+峰值。
 
-## 15. DFlash2：为什么没有使用
+## 24GB 机器历史对照
 
-当前 Flash-Next llama.cpp 服务没有使用 DFlash2。
+上一台 8 x RTX 4090 24GB 上，相同 `UD-IQ4_XS` 的历史最佳为：
 
-DFlash2 是旧 Qwen3.8-27B SGLang 路线中使用的独立 speculative draft model：
+| 配置 | Context | Decode |
+|---|---:|---:|
+| 4 卡 layer split，无 MTP | 131K | 42.25 tok/s |
+| 8 卡 layer split，无 MTP | 131K | 40.43 tok/s |
 
-```text
-z-lab/Qwen3.8-27B-DFlash2
-```
+48GB 机器的 2 卡无 MTP 已达到 78.95 tok/s，启用 MTP 后达到约 122 tok/s。不要把旧机器
+“4 卡最佳”和“MTP 不可用”的结论继续用于当前部署。
 
-旧路线在同一台机器上的长 context decode 数据：
-
-| 实际 prompt | Qwen3.8-27B + DFlash2 Decode |
-|---:|---:|
-| 约 61K | 57.54 tok/s |
-| 约 112K | 34.22 tok/s |
-
-它不能直接用于当前服务：
-
-1. Draft checkpoint 的目标模型是 Qwen3.8-27B，不是 Qwen3.8-Flash-Next。
-2. 当前 Qwen4Exp llama.cpp 分支没有实现该架构的 DFlash2/MTP/NEXTN speculative decode。
-3. 不同目标模型之间不能安全共享 speculative draft。
-
-因此当前架构是：
-
-```text
-Qwen3.8-Flash-Next IQ4_XS
-  + llama.cpp layer split
-  + prompt cache
-  + Responses API
-  + Codex profile
-  - DFlash2
-  - MTP/NEXTN
-```
-
-如果目标是 Flash-Next 模型能力和 4 卡资源占用，使用当前方案；如果目标是超长活跃上下文的
-decode 速度，旧 27B + DFlash2 仍有参考价值，但它是另一套模型服务。
-
-## 16. systemd 部署
-
-仓库包含示例 user unit：
-
-```text
-qwen3.8-flash-next.service
-```
-
-公开发布前，应把 unit 中的部署路径修改为自己的实际路径。
-
-安装：
-
-```bash
-systemctl --user link "$DEPLOY_ROOT/qwen3.8-flash-next.service"
-systemctl --user daemon-reload
-systemctl --user enable --now qwen3.8-flash-next.service
-```
-
-允许退出登录后继续运行：
-
-```bash
-loginctl enable-linger "$USER"
-```
-
-运维：
-
-```bash
-systemctl --user status qwen3.8-flash-next.service --no-pager -l
-systemctl --user restart qwen3.8-flash-next.service
-journalctl --user -u qwen3.8-flash-next.service -f
-```
-
-也可以使用仓库脚本：
-
-```bash
-./start.sh 4gpu
-./status.sh
-./stop.sh
-```
-
-## 17. Cloudflare Tunnel（可选）
-
-如需公网访问，可以将 Cloudflare Tunnel 的 HTTP origin 指向：
-
-```text
-http://127.0.0.1:8001
-```
-
-公网客户端仍使用：
-
-```text
-https://your-domain.example/v1
-```
-
-建议：
-
-- 保留 llama.cpp API key 鉴权。
-- 不要在仓库中公开 Tunnel token、API key 或真实内部域名。
-- 优先使用 Cloudflare Access、IP 策略或额外反向代理访问控制。
-- Codex 使用 streaming Responses API，避免长生成等待到请求结束才返回。
-- 验证 `/v1/models` 和 `/v1/responses`，不能只检查 Tunnel 进程状态。
-
-公网流式 Responses API 已在本次部署中完成端到端验证，但公开报告不记录真实域名和凭据。
-
-## 18. 安全与开源发布
-
-不要提交：
-
-- `.api-key`
-- `.env*`
-- Cloudflare token
-- GGUF 权重
-- Hugging Face / ModelScope cache
-- `llama-server.log`
-- PID 文件
-- `__pycache__`
-- llama.cpp build 目录
-- 嵌套的 llama.cpp Git clone
-
-发布前运行：
-
-```bash
-git status --short
-git ls-files | grep -E '(api-key|\.env|token|\.gguf|llama-server\.log)'
-```
-
-并使用 secret scanner 检查 Git 历史，而不仅是工作区。
-
-模型权重和上游源码有各自的许可证。不要把模型文件或 llama.cpp 源码直接重新打包进本仓库，
-除非已经核验并遵守对应许可证和分发条款。
-
-## 19. 已知限制
-
-- Qwen4Exp llama.cpp 支持来自实验分支，不是所有主线版本都可直接加载该架构。
-- 当前没有 Flash-Next speculative decoding。
-- 单 slot 配置面向单用户，不代表高并发吞吐。
-- 长 context 冷 prefill 成本很高。
-- Passkey 测试不代表完整长上下文推理质量。
-- IQ4_XS 是质量、显存和速度折中，没有在本报告中完成系统化质量评测。
-- “理论上强于 27B”需要业务评测验证，不能仅凭总参数量判断。
-- Cloudflare、反向代理和客户端可能有各自的超时限制。
-
-## 20. 推荐部署矩阵
-
-| 目标 | 推荐方案 |
-|---|---|
-| 单用户、速度与质量平衡 | 4×4090、IQ4_XS、131K、layer split |
-| 最低卡数实验 | 3×4090、ubatch 256，谨慎使用 |
-| 原生最大 context 实验 | 4×4090、262K，接受更小显存余量 |
-| 整机并发吞吐 | 两个独立 4 卡副本 |
-| Codex 多轮会话 | 4 卡 + 131K + prompt cache + Responses API |
-| 超长冷文档 | 离线处理，避免实时交互预期 |
-| 超长活跃 context decode 优先 | 评估另一套 27B + DFlash2 服务 |
-
-## 21. 文件说明
+## 文件
 
 | 文件 | 用途 |
 |---|---|
-| `README.md` | 完整部署和实验报告 |
-| `launch.sh` | 3/4/8 GPU llama-server 启动入口 |
-| `start.sh` | 后台或 systemd 启动 |
-| `stop.sh` | 停止服务 |
-| `status.sh` | 服务和 GPU 状态 |
-| `benchmark.py` | 短输出 decode 基准 |
-| `long_context_benchmark.py` | 长 context prefill 与 passkey 测试 |
-| `prompt_cache_benchmark.py` | Responses API cache 命中测试 |
-| `codex-models.json` | Codex 本地模型 metadata |
-| `qwen3.8-flash-next-codex.jinja` | 兼容 Codex 多轮 developer/system 消息的模板 |
-| `qwen3.8-flash-next.service` | systemd user unit 示例 |
+| `launch.sh` | 1/2/3/4/8 卡、NUMA、MTP 启动入口 |
+| `start.sh` / `stop.sh` / `status.sh` | 后台服务管理 |
+| `tools/bootstrap.sh` | uv + 国内 PyPI 环境 |
+| `tools/build-llama.sh` | 固定 MTP commit 的 SM89 构建 |
+| `tools/download-model.sh` | ModelScope/hf-mirror 模型下载 |
+| `tools/install-service.sh` | 按当前路径安装用户级 systemd 服务 |
+| `tools/range-download.sh` | 可靠 Range 断点续传 |
+| `model-checksums.sha256` | 模型完整 SHA256 |
+| `benchmark.py` | Decode、服务端 timing、MTP 接受率 |
+| `long_context_benchmark.py` | 冷长上下文 passkey |
+| `prompt_cache_benchmark.py` | Responses Prompt Cache |
+| `qwen3.8-flash-next-codex.jinja` | Codex 多轮模板兼容 |
+| `codex-models.json` | Codex 本地模型目录 |
 
-## 22. 复现检查清单
+## 限制
 
-- [ ] 核对 GPU 拓扑与 NUMA node
-- [ ] 准备足够 NVMe 空间
-- [ ] 构建 SM89 CUDA llama.cpp
-- [ ] 下载并校验 3 个 IQ4_XS 分片
-- [ ] 创建独立 `.api-key`
-- [ ] 修改模型路径和 systemd 部署路径
-- [ ] 首先启动 4 卡 layer split
-- [ ] 验证 `/v1/models`
-- [ ] 验证 `/v1/responses` streaming
-- [ ] 确认进程已加载 Codex 兼容 chat template
-- [ ] 验证中途 developer 消息不会触发 HTTP 500
-- [ ] 运行 200/512-token decode benchmark
-- [ ] 连续请求验证 Prompt Cache
-- [ ] 根据业务长度测试 8K/32K context
-- [ ] 配置 Codex profile
-- [ ] 验证至少一次 shell tool call
-- [ ] 公网发布前运行 secret scan
+- IQ4_XS 是速度、质量和显存的折中，本报告没有完成系统化质量评测。
+- passkey 只验证远距离信息保持，不等价于长文多跳推理。
+- 单并发 MTP 数据不能代表多用户吞吐。
+- MTP 仍来自实验 PR，升级 llama.cpp 后必须重新验证 shared sidecar、API 和速度。
+- 262K 是容量上限，不是推荐每轮都填满的日常输入长度。
+- 服务默认只监听 localhost；公网暴露需要额外鉴权、TLS 和访问控制。
 
-## 致谢
+## 发布检查
 
-本部署主要参考了 SGLang 官方文档、Unsloth 的 Qwen4Exp llama.cpp 实现，以及
-`tonyd2wild/Qwen3.8-Flash-Next-Fleet-Deploy` 的 RTX 3090 实践报告。
+不要提交：
 
-特别有价值的社区结论是：Qwen3.8-Flash-Next 在消费级 GPU 上的高性能路径并不一定是
-官方数据中心 GPU 配置的直接缩小版；GGUF mmap、PCIe 拓扑和多卡切分方式可能比理论 FLOPS
-更决定实际单 token 延迟。
+- API key、代理地址或凭据
+- GGUF 权重及下载分块
+- Python 虚拟环境与 uv cache
+- llama.cpp clone/build
+- 服务日志、PID、原始基准输出
+
+```bash
+git status --short
+git ls-files | grep -E '(api-key|\.env|token|\.gguf|llama-server\.log)' || true
+git diff --check
+```

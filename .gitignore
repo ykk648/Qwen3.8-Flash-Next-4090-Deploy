@@ -27,6 +27,8 @@ nohup.out
 __pycache__/
 *.py[cod]
 .venv/
+.venv-*/
+.tools/
 
 # Local benchmark output
 benchmark-results/
