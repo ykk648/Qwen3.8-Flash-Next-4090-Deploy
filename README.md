@@ -232,6 +232,13 @@ DRAFT_N=5 ./launch.sh 2gpu
 ./tools/install-service.sh
 ```
 
+systemd 服务默认仍只监听本机。允许局域网访问时，显式绑定服务器的局域网地址，并配合
+防火墙限制可信网段。不要直接暴露到公网：
+
+```bash
+SERVICE_HOST=10.0.0.10 ./tools/install-service.sh
+```
+
 ## 卡数实测
 
 131K context、layer split、512 输出 tokens、greedy、3 次中位数：
