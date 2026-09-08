@@ -9,6 +9,9 @@ chunk_size=${CHUNK_SIZE:-536870912}
 parts_dir="${output}.parts"
 mkdir -p "$parts_dir" "$(dirname "$output")"
 
+exec 9>"${output}.lock"
+flock 9
+
 if [[ -f "$output" ]] && [[ $(stat -c %s "$output") -eq $size ]]; then
   echo "Already downloaded $output ($size bytes)"
   exit 0
@@ -19,7 +22,12 @@ stop_jobs() {
   pids=$(jobs -pr)
   [[ -z "$pids" ]] || kill $pids 2>/dev/null || true
 }
-trap stop_jobs EXIT INT TERM
+on_signal() {
+  stop_jobs
+  exit 130
+}
+trap stop_jobs EXIT
+trap on_signal INT TERM
 
 download_part() {
   local start=$1
@@ -30,6 +38,16 @@ download_part() {
   local segment_file="${tmp_file}.segment"
   local have remote_start segment_size
   local stalled_attempts=0
+  local curl_pid=
+
+  stop_curl() {
+    if [[ -n "$curl_pid" ]]; then
+      kill "$curl_pid" 2>/dev/null || true
+      wait "$curl_pid" 2>/dev/null || true
+    fi
+    exit 130
+  }
+  trap stop_curl INT TERM
 
   touch "$tmp_file"
   while true; do
@@ -58,7 +76,10 @@ download_part() {
     curl --fail --location --silent --show-error --http1.1 \
       --connect-timeout 20 --speed-limit 65536 --speed-time 30 \
       --retry 5 --retry-all-errors --retry-delay 2 \
-      --range "$remote_start-$end" "$url" --output "$segment_file" || true
+      --range "$remote_start-$end" "$url" --output "$segment_file" &
+    curl_pid=$!
+    wait "$curl_pid" || true
+    curl_pid=
 
     segment_size=0
     [[ ! -f "$segment_file" ]] || segment_size=$(stat -c %s "$segment_file")

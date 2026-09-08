@@ -1,11 +1,12 @@
 [Unit]
-Description=Qwen3.8-Flash-Next llama.cpp server (2x 48GB RTX 4090)
+Description=Qwen3.8-Flash-Next Q4_K_XL llama.cpp server (3x 48GB RTX 4090)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=@DEPLOY_ROOT@
+Environment=MODEL=@DEPLOY_ROOT@/models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 Environment=CONTEXT=262144
 Environment=HOST=@HOST@
 Environment=BATCH_SIZE=2048
@@ -13,7 +14,7 @@ Environment=UBATCH_SIZE=512
 Environment=SPLIT_MODE=layer
 Environment=SPEC_MTP=1
 Environment=DRAFT_N=4
-ExecStart="@DEPLOY_ROOT@/launch.sh" 2gpu
+ExecStart="@DEPLOY_ROOT@/launch.sh" 3gpu
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGINT

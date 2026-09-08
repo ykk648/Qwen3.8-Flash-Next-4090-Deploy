@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PROFILE=${1:-2gpu}
-MODEL=${MODEL:-$ROOT/models/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf}
+PROFILE=${1:-3gpu}
+MODEL=${MODEL:-$ROOT/models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf}
 MTP_MODEL=${MTP_MODEL:-$ROOT/models/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf}
 PORT=${PORT:-8001}
 HOST=${HOST:-127.0.0.1}
@@ -11,9 +11,11 @@ CONTEXT=${CONTEXT:-262144}
 BATCH_SIZE=${BATCH_SIZE:-2048}
 UBATCH_SIZE=${UBATCH_SIZE:-512}
 SPLIT_MODE=${SPLIT_MODE:-layer}
+TENSOR_SPLIT=${TENSOR_SPLIT:-}
 N_GPU_LAYERS=${N_GPU_LAYERS:-}
 SPEC_MTP=${SPEC_MTP:-1}
 DRAFT_N=${DRAFT_N:-4}
+DRAFT_CACHE_TYPE=${DRAFT_CACHE_TYPE:-}
 API_KEY_FILE=${API_KEY_FILE:-$ROOT/.api-key}
 CHAT_TEMPLATE=${CHAT_TEMPLATE:-$ROOT/qwen3.8-flash-next-codex.jinja}
 
@@ -55,10 +57,14 @@ export CUDA_VISIBLE_DEVICES=${GPUS:-$default_gpus}
 CPU_SET=${CPU_SET-$default_cpu_set}
 N_GPU_LAYERS=${N_GPU_LAYERS:-$default_ngl}
 gpu_count=$(awk -F, '{print NF}' <<<"$CUDA_VISIBLE_DEVICES")
-tensor_split=1
-for ((i = 1; i < gpu_count; i++)); do
-  tensor_split+=,1
-done
+if [[ -n "$TENSOR_SPLIT" ]]; then
+  tensor_split=$TENSOR_SPLIT
+else
+  tensor_split=1
+  for ((i = 1; i < gpu_count; i++)); do
+    tensor_split+=,1
+  done
+fi
 
 if [[ "${ALLOW_BUSY_GPUS:-0}" != 1 ]] && command -v nvidia-smi >/dev/null 2>&1; then
   mapfile -t busy_uuids < <(
@@ -108,6 +114,12 @@ if [[ "$SPEC_MTP" == 1 ]]; then
     --spec-draft-n-max "$DRAFT_N"
     --spec-draft-ngl 999
   )
+  if [[ -n "$DRAFT_CACHE_TYPE" ]]; then
+    args+=(
+      --cache-type-k-draft "$DRAFT_CACHE_TYPE"
+      --cache-type-v-draft "$DRAFT_CACHE_TYPE"
+    )
+  fi
 fi
 
 if [[ -n "$CPU_SET" ]]; then

@@ -14,24 +14,29 @@ Qwen3.8-Flash-Next 面向单用户 Codex 的低延迟部署路线。
 | 引擎 | Unsloth llama.cpp MTP PR #144 |
 | 固定提交 | `a9e9c3c5fed8a0bb5cc617532d0d16b8f59c13e0` |
 | 模型 | `unsloth/Qwen3.8-Flash-Next-GGUF` |
-| 量化 | `UD-IQ4_XS`，93.68GB |
-| GPU | **2 x RTX 4090 48GB**，同 NUMA、同 PIX 组 |
+| 量化 | **`UD-Q4_K_XL`，111.33GB** |
+| GPU | **3 x RTX 4090 48GB**，同 NUMA |
 | 切分 | `--split-mode layer` |
 | Context | **262,144** |
 | MTP | shared Q8_0，`draft=4` |
 | 并发 | 1 slot |
 | API | OpenAI-compatible Responses / Chat Completions / Completions |
-| 512-token decode | **123.61 tok/s**，三次中位数 |
-| 英文单 prompt 峰值 | **126.09 tok/s**，`draft=5` |
+| 512-token decode | **117.02 tok/s**，三次中位数 |
+| 2 卡短 prompt 实验值 | 229K，121.87 tok/s，但 6K prefill OOM |
 
 最重要的发现：
 
-1. 48GB 卡让 `UD-IQ4_XS` 在 2 卡上全 GPU 运行，2 卡比 3/4 卡更快。
-2. MTP 已可用。旧报告中“llama.cpp 不支持 Flash-Next MTP”的结论已经过期。
-3. 面向中英文和代码生成的稳健默认是 `draft=4`；`draft=5` 只在本次英文 prompt 上略快。
-4. 真实 250K 请求完成并正确检索 passkey，不是只验证服务能分配 262K KV cache。
-5. 该机器所有 GPU 间 PCIe P2P 不可用，row split 无法加载；layer split 是正确路线。
-6. MTP 适合单并发低延迟，不应直接用于高并发吞吐服务。
+1. `UD-Q4_K_XL` 与 `UD-IQ4_XS` 参数量相同，但量化更温和、文件大 18.84%，量化损失
+   预期更低。三卡稳定配置比原 IQ4_XS 两卡配置慢 5.33%。
+2. 2 卡 229K 的短 prompt 达到 121.87 tok/s，仅比 IQ4_XS 慢 1.41%，但只剩 118MiB；
+   真实约 6K prefill 会因 CUDA 临时缓冲 OOM。生产 sweet point 是 3 卡 262K，不能只以
+   “成功加载”作为标准。
+3. 4 卡只有 104.31 tok/s。layer split 增加卡数不会并行计算单 token 的不同层。
+4. Q4_K_XL 的 MTP 最优仍是 `draft=4`；`draft=5` 降到 119.64 tok/s。
+5. 48GB 卡让 `UD-IQ4_XS` 在 2 卡上以 262K 全 GPU 运行，但它现在作为更省空间的备选。
+6. MTP 已可用。旧报告中“llama.cpp 不支持 Flash-Next MTP”的结论已经过期。
+7. 该机器所有 GPU 间 PCIe P2P 不可用，row split 无法加载；layer split 是正确路线。
+8. MTP 适合单并发低延迟，不应直接用于高并发吞吐服务。
 
 ## 实验环境
 
@@ -48,13 +53,15 @@ Qwen3.8-Flash-Next 面向单用户 Codex 的低延迟部署路线。
 - 无 NVLink
 - CUDA P2P read/write 与 PCIe P2P 均不可用
 
-测试期间 GPU 0-2 有其他任务，因此所有新基准只使用 GPU 4-7，并将进程绑定到：
+IQ4_XS 基准使用 GPU 4-7 / NUMA 1；Q4_K_XL 基准使用 GPU 0-3 / NUMA 0。两组均在
+GPU 空闲时测试，并把进程绑定到对应 NUMA CPU：
 
 ```text
-CPU 32-63,96-127 / NUMA 1
+GPU 0-3: CPU 0-31,64-95 / NUMA 0
+GPU 4-7: CPU 32-63,96-127 / NUMA 1
 ```
 
-仓库启动器默认选择 GPU 4、5。其他机器可以通过 `GPUS` 和 `CPU_SET` 显式覆盖。
+仓库启动器默认选择 GPU 4、5、6。其他机器可以通过 `GPUS` 和 `CPU_SET` 显式覆盖。
 
 ### 软件
 
@@ -70,14 +77,19 @@ CPU 32-63,96-127 / NUMA 1
 Qwen3.8-Flash-Next 包含很大的 PLE n-gram embedding table。GGUF + mmap 可以让该表主要
 保留在系统内存和页缓存中，计算权重则 offload 到 GPU。
 
-本机 2 卡 131K、无 MTP 时显存约为：
+Q4_K_XL 2 卡 229K + MTP `draft=4` 的静态显存约为：
 
 | GPU | 显存 |
 |---|---:|
-| GPU 4 | 35,697MiB |
-| GPU 5 | 34,089MiB |
+| GPU 0 | 47,379MiB |
+| GPU 1 | 48,391MiB |
 
-最终 2 卡 262K + MTP `draft=4` 实例约为 39,493MiB / 42,263MiB，仍有可用余量。
+第二张卡只剩约 118MiB。2 卡 262K 即使把 draft KV 从 F16 降到 Q8_0、Q4_0 仍然
+OOM；调整 tensor split 又会跨过完整层边界，使另一张卡缺少 compute buffer。因此 229K
+是 Q4_K_XL 在当前 layer 粒度下的两卡加载上限，但不是运行稳定上限：约 6K token prefill
+触发 top-k 临时缓冲分配时仍会 OOM。生产配置因此使用 3 卡 262K。
+
+作为对照，IQ4_XS 2 卡 262K + MTP `draft=4` 约为 39,493 / 42,263MiB。
 
 单卡无法全 GPU 加载 IQ4_XS：即使 context 降到 32K，仍尝试分配约 61.2GiB CUDA
 权重缓冲。将 32 层 offload 到单卡后可以运行，但只有 17.83 tok/s。
@@ -94,7 +106,8 @@ Qwen3.8-Flash-Next 包含很大的 PLE n-gram embedding table。GGUF + mmap 可�
 A-XIANGQAQ 的单 48GB 卡方案和 TomPython 的双卡方案使用 NVFP4 + Lsglang/lk_moe
 CPU-GPU 混合推理，适合卡数受限场景。其公开 decode 约为 36-40 tok/s 和 34.8 tok/s。
 
-本机目标是“卡数不限、单流尽可能快”，因此选择 2 x 48GB 全 GPU GGUF + MTP。
+本机目标是“卡数不限、单流尽可能快且能承受真实 Codex prompt”，因此选择
+3 x 48GB 全 GPU GGUF + MTP。
 这些结果不是同一量化和同一引擎下的严格横向质量评测。
 
 ## 使用 uv 和国内源
@@ -111,7 +124,7 @@ uv cache 也保存在项目目录内：
 
 ## 下载模型
 
-默认使用 ModelScope 国内镜像：
+默认使用 ModelScope 国内镜像并下载推荐的 Q4_K_XL：
 
 ```bash
 ./tools/download-model.sh
@@ -125,7 +138,12 @@ DOWNLOAD_BASE=https://hf-mirror.com/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main
 ```
 
 下载器支持 HTTP Range、分块内断点续传、低速超时和已有分块复用。默认只使用一个连接，
-避免代理或镜像在高并发下载时重置 TLS。
+避免代理或镜像在高并发下载时重置 TLS。可按需选择量化，避免同时下载两套百 GB 权重：
+
+```bash
+QUANT=UD-IQ4_XS ./tools/download-model.sh
+QUANT=all ./tools/download-model.sh
+```
 
 国内镜像不可用时，可在当前 shell 临时设置标准代理环境变量后重试。不要把代理地址、
 凭据或环境文件提交到仓库。
@@ -137,6 +155,10 @@ DOWNLOAD_BASE=https://hf-mirror.com/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main
 | `UD-IQ4_XS/...00001-of-00003.gguf` | 10,946,624 | `5ce89370...e71a4` |
 | `UD-IQ4_XS/...00002-of-00003.gguf` | 49,835,229,856 | `577a38a2...aaa7` |
 | `UD-IQ4_XS/...00003-of-00003.gguf` | 43,836,407,744 | `d4634e6d...8833` |
+| `UD-Q4_K_XL/...00001-of-00004.gguf` | 10,946,624 | `44481862...8082` |
+| `UD-Q4_K_XL/...00002-of-00004.gguf` | 49,859,583,136 | `3f342f1c...a6c9` |
+| `UD-Q4_K_XL/...00003-of-00004.gguf` | 49,376,141,504 | `56758f40...9cbd3` |
+| `UD-Q4_K_XL/...00004-of-00004.gguf` | 12,087,983,520 | `753bda48...510a` |
 | `MTP/...shared-Q8_0.gguf` | 2,786,568,256 | `5ff54097...e6` |
 
 完整校验值位于 `model-checksums.sha256`：
@@ -188,7 +210,7 @@ chmod 600 .api-key
 等价关键参数：
 
 ```text
-GPU 4,5
+GPU 4,5,6
 --split-mode layer
 --ctx-size 262144
 --parallel 1
@@ -207,8 +229,12 @@ GPUS=0,1 CPU_SET=0-31,64-95 ./launch.sh 2gpu
 # 131K、关闭 MTP
 CONTEXT=131072 SPEC_MTP=0 ./launch.sh 2gpu
 
-# 英文固定输出可实验 draft=5
-DRAFT_N=5 ./launch.sh 2gpu
+# 两卡仅用于继续探索更低 context；229K 不能承受真实 6K prefill
+CONTEXT=196608 ./launch.sh 2gpu
+
+# 使用较小的 IQ4_XS，在两卡上保留完整 262K
+MODEL=$PWD/models/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf \
+  CONTEXT=262144 ./launch.sh 2gpu
 ```
 
 默认仅监听 `127.0.0.1:8001`。确需局域网监听时显式设置 `HOST=0.0.0.0`，并确保
@@ -241,7 +267,24 @@ SERVICE_HOST=10.0.0.10 ./tools/install-service.sh
 
 ## 卡数实测
 
-131K context、layer split、512 输出 tokens、greedy、3 次中位数：
+Q4_K_XL、layer split、512 输出 tokens、greedy、3 次中位数：
+
+| GPU | Context | MTP | Decode | 接受率 | 各卡静态显存 | 结论 |
+|---:|---:|---:|---:|---:|---|---|
+| 2 x 48GB | 229K | draft=4 | **121.87 tok/s** | 61.03% | 47,379 / 48,391MiB | 6K prefill OOM |
+| 2 x 48GB | 229K | draft=5 | 119.64 tok/s | 54.48% | 47,439 / 48,443MiB | 更慢，且余量更小 |
+| 2 x 48GB | 196K | draft=4 | 116.43 tok/s | 61.64% | 46,501 / 48,093MiB | 8K/32K passkey 通过 |
+| 3 x 48GB | 262K | draft=4 | **117.02 tok/s** | 64.35% | 34,197 / 32,241 / 35,951MiB | **生产推荐** |
+| 4 x 48GB | 262K | draft=4 | 104.31 tok/s | 55.86% | 26,999 / 24,779 / 25,029 / 28,721MiB | 无收益 |
+
+3 卡 262K 是当前生产 sweet point：比两卡 229K 短 prompt 理论值慢约 4%，但保留完整
+context，并有至少约 12.5GiB/卡静态余量。两卡降到 196K 后虽通过 32K prefill，速度也
+只有 116.43 tok/s，因此只适合必须节省一张 GPU 的场景。4 卡比 2 卡慢 14.4%，没有
+部署价值。Q4_K_XL 的权重文件共 111,334,654,784 bytes，
+比 IQ4_XS 的 93,682,584,224 bytes 大 18.84%。更温和的量化通常能降低模型能力损失，
+但本报告尚未把这种预期收益量化为任务准确率。
+
+以下是 IQ4_XS 的历史对照，均为 131K context：
 
 | 配置 | MTP | Decode | 相对 2 卡无 MTP |
 |---|---|---:|---:|
@@ -305,7 +348,7 @@ device CUDA0 does not support split buffers
 
 ## Context 与 Prompt Cache
 
-2 卡、262K、MTP draft=4 的冷 passkey 检索：
+IQ4_XS 2 卡、262K、MTP draft=4 的冷 passkey 检索：
 
 | 实际输入 | TTFT | 末端 decode | passkey |
 |---:|---:|---:|---|
@@ -402,7 +445,7 @@ UV_CACHE_DIR=$PWD/.cache/uv ./.tools/uv run --no-project \
 
 ## 24GB 机器历史对照
 
-上一台 8 x RTX 4090 24GB 上，相同 `UD-IQ4_XS` 的历史最佳为：
+上一台 8 x RTX 4090 24GB 上，`UD-IQ4_XS` 的历史最佳为：
 
 | 配置 | Context | Decode |
 |---|---:|---:|
@@ -432,11 +475,11 @@ UV_CACHE_DIR=$PWD/.cache/uv ./.tools/uv run --no-project \
 
 ## 限制
 
-- IQ4_XS 是速度、质量和显存的折中，本报告没有完成系统化质量评测。
+- Q4_K_XL 的质量收益来自更温和量化的合理预期，本报告没有完成系统化准确率评测。
 - passkey 只验证远距离信息保持，不等价于长文多跳推理。
 - 单并发 MTP 数据不能代表多用户吞吐。
 - MTP 仍来自实验 PR，升级 llama.cpp 后必须重新验证 shared sidecar、API 和速度。
-- 262K 是容量上限，不是推荐每轮都填满的日常输入长度。
+- Q4_K_XL 两卡 229K 只能加载和运行短 prompt；稳定生产使用三卡 262K。
 - 服务默认只监听 localhost；公网暴露需要额外鉴权、TLS 和访问控制。
 
 ## 发布检查

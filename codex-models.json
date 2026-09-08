@@ -3,7 +3,7 @@
     {
       "slug": "qwen3.8-flash-next",
       "display_name": "Qwen3.8 Flash Next (Local)",
-      "description": "Local Qwen3.8-Flash-Next IQ4_XS served by llama.cpp with MTP on 2x 48GB RTX 4090.",
+      "description": "Local Qwen3.8-Flash-Next Q4_K_XL served by llama.cpp with MTP on 3x 48GB RTX 4090.",
       "base_instructions": "You are Codex, a coding agent. Work directly in the user's repository, use tools when needed, make focused changes, verify your work, and report results concisely.",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
